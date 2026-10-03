@@ -1,19 +1,20 @@
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi.concurrency import run_in_threadpool
 from fastapi import Depends, FastAPI, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db, init_db
-from app.llm import embed_documents
-from app.ingest import chunk_text, extract_pages
+from app.llm import embed_query, generate_answer
 from app.models import Chunk, Document
-
-from app.llm import embed_documents, embed_query, generate_answer
-from pydantic import BaseModel
+from app.worker import process_document
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/data/uploads"))
 
 
 @asynccontextmanager
@@ -25,7 +26,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="PDF Question Answering API", lifespan=lifespan)
 
 
-@app.post("/documents", status_code=201)
+@app.post("/documents", status_code=202)
 async def upload_document(file: UploadFile, db: Session = Depends(get_db)):
     if file.content_type != "application/pdf":
         raise HTTPException(400, "Only PDF files are supported")
@@ -33,37 +34,34 @@ async def upload_document(file: UploadFile, db: Session = Depends(get_db)):
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, "File too large (max 10 MB)")
 
-    pages = extract_pages(data)
-    if not pages:
-        raise HTTPException(422, "No extractable text found (scanned PDFs are not supported)")
-
-    doc = Document(filename=file.filename)
-    for page_no, text in pages:
-        for idx, piece in enumerate(chunk_text(text)):
-            doc.chunks.append(Chunk(page=page_no, chunk_index=idx, content=piece))
-    try:
-        vectors = await run_in_threadpool(embed_documents, [c.content for c in doc.chunks])
-    except Exception as e:
-        raise HTTPException(502, f"Embedding failed: {e}")
-    for chunk, vec in zip(doc.chunks, vectors):
-        chunk.embedding = vec
+    doc = Document(filename=file.filename, status="pending")
     db.add(doc)
     db.commit()
     db.refresh(doc)
-    return {"id": doc.id, "filename": doc.filename, "pages": len(pages), "chunks": len(doc.chunks)}
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    (UPLOAD_DIR / f"{doc.id}.pdf").write_bytes(data)
+
+    process_document.delay(doc.id)
+    return {"id": doc.id, "filename": doc.filename, "status": doc.status}
 
 
 @app.get("/documents")
 def list_documents(db: Session = Depends(get_db)):
     rows = db.execute(
-        select(Document.id, Document.filename, Document.created_at, func.count(Chunk.id))
+        select(
+            Document.id,
+            Document.filename,
+            Document.created_at,
+            Document.status,
+            Document.error,
+            func.count(Chunk.id).label("chunks"),
+        )
         .join(Chunk, isouter=True)
         .group_by(Document.id)
         .order_by(Document.id)
     ).all()
-    return [{"id": r[0], "filename": r[1], "created_at": r[2], "chunks": r[3]} for r in rows]
-
-
+    return [dict(r._mapping) for r in rows]
 
 
 class AskRequest(BaseModel):

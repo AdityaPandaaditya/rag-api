@@ -15,16 +15,40 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+
   api:
     build: .
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://rag:rag@db:5432/rag
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - uploads:/data/uploads
+
+  worker:
+    build: .
+    command: celery -A app.worker worker --loglevel=info --concurrency=2
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://rag:rag@db:5432/rag
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - uploads:/data/uploads
 
 volumes:
   pgdata:
+  uploads:
