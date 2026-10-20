@@ -168,3 +168,11 @@ docker-compose.yml   api, worker, PostgreSQL + pgvector, Redis
 - Streaming responses
 - Delete endpoint and duplicate-upload detection
 - Deployment to AWS
+
+
+## Limitations
+
+- Scanned PDFs aren't supported: the document is marked `failed` with a clear error.
+- Only PDFs up to 10 MB are accepted.
+- Search is an exact scan, with no vector index (HNSW) yet.
+- No task retries: a failed document needs a re-upload.
